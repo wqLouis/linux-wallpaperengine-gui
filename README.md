@@ -2,8 +2,6 @@
 
 A modern GUI manager for [linux-wallpaperengine](https://github.com/0xFA11/linux-wallpaperengine) — browse, apply, and manage animated wallpapers from Steam Workshop with a sleek dark-themed interface.
 
-![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)
-
 ## Features
 
 - **Library browser** — discover and preview all your Wallpaper Engine wallpapers (both Steam Workshop and built-in)
@@ -96,4 +94,4 @@ Configured via the Settings tab in the GUI.
 
 ## License
 
-MIT OR Apache-2.0
+TBD
