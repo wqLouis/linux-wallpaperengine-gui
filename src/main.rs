@@ -1,12 +1,33 @@
-mod app;
 mod config;
+mod gui;
+mod ipc;
+mod theme;
+mod tray;
 mod wallpaper;
 
-use app::App;
+use gui::GuiApp;
 
-fn main() -> iced::Result {
-    iced::application(App::new, App::update, App::view)
-        .title(App::title)
-        .subscription(App::subscription)
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() > 1 && args[1] == "--gui" {
+        log::info!("Starting GUI mode");
+        run_gui();
+    } else {
+        log::info!("Starting tray mode");
+        tray::run_tray();
+    }
+}
+
+fn dark_theme(_: &GuiApp) -> iced::Theme { iced::Theme::Dark }
+
+fn run_gui() {
+    iced::application(GuiApp::new, GuiApp::update, GuiApp::view)
+        .title(GuiApp::title)
+        .subscription(GuiApp::subscription)
+        .theme(dark_theme)
         .run()
+        .expect("Failed to run GUI");
 }

@@ -35,25 +35,110 @@ fn which_bin(name: &str) -> bool {
     false
 }
 
+/// Parameters for linux-wallpaper-engine CLI
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EngineParams {
+    /// Output mode (e.g. "wlr", "kms", "x11")
+    #[serde(default = "default_mode")]
+    pub mode: String,
+
+    /// How the wallpaper fits the screen: "cover", "contain", "fill", "stretch"
+    #[serde(default = "default_fit_mode")]
+    pub fit_mode: String,
+
+    /// Log level: "error", "warning", "info", "debug", "trace"
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+
+    /// Target FPS. None = render as fast as possible
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_fps: Option<u32>,
+
+    /// Disable effects
+    #[serde(default)]
+    pub no_effects: bool,
+
+    /// Use stdin for JSON config instead of CLI args
+    #[serde(default)]
+    pub use_stdin: bool,
+}
+
+fn default_mode() -> String {
+    "wlr".to_string()
+}
+fn default_fit_mode() -> String {
+    "cover".to_string()
+}
+fn default_log_level() -> String {
+    "warning".to_string()
+}
+impl Default for EngineParams {
+    fn default() -> Self {
+        Self {
+            mode: default_mode(),
+            fit_mode: default_fit_mode(),
+            log_level: default_log_level(),
+            target_fps: None,
+            no_effects: false,
+            use_stdin: false,
+        }
+    }
+}
+
+/// Parameters for mpvpaper
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MpvpaperParams {
+    /// mpv options passed to the mpv instance
+    #[serde(default)]
+    pub mpv_options: Vec<String>,
+
+    /// Output to apply wallpaper to (e.g. "HDMI-A-1", "*" for all)
+    #[serde(default = "default_output")]
+    pub output: String,
+}
+
+fn default_output() -> String {
+    "*".to_string()
+}
+
+impl Default for MpvpaperParams {
+    fn default() -> Self {
+        Self {
+            mpv_options: vec!["loop".to_string()],
+            output: default_output(),
+        }
+    }
+}
+
 /// Application configuration persisted to disk (TOML format)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     /// Path to the steamapps directory (contains common/ and workshop/)
+    #[serde(default)]
     pub steamapps_path: String,
+
+    /// linux-wallpaper-engine parameters
+    #[serde(default)]
+    pub engine: EngineParams,
+
+    /// mpvpaper parameters
+    #[serde(default)]
+    pub mpvpaper: MpvpaperParams,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             steamapps_path: String::new(),
+            engine: EngineParams::default(),
+            mpvpaper: MpvpaperParams::default(),
         }
     }
 }
 
 impl Config {
     fn config_path() -> PathBuf {
-        let mut path = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         path.push("linux-wallpaperengine-gui");
         std::fs::create_dir_all(&path).ok();
         path.push("config.toml");
@@ -131,5 +216,23 @@ impl Config {
         } else {
             None
         }
+    }
+
+    /// Path to the IPC socket
+    pub fn socket_path() -> PathBuf {
+        let mut path = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        path.push("linux-wallpaperengine-gui");
+        std::fs::create_dir_all(&path).ok();
+        path.push("ipc.sock");
+        path
+    }
+
+    /// Path that stores the socket path for GUI to find the tray
+    pub fn socket_info_path() -> PathBuf {
+        let mut path = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        path.push("linux-wallpaperengine-gui");
+        std::fs::create_dir_all(&path).ok();
+        path.push("ipc-info.json");
+        path
     }
 }

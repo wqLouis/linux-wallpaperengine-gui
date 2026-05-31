@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 /// Type of wallpaper
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum WallpaperType {
     Scene,
     Video,
@@ -10,7 +10,7 @@ pub enum WallpaperType {
 }
 
 /// Represents a discovered wallpaper
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Wallpaper {
     pub title: String,
     pub wallpaper_type: WallpaperType,
