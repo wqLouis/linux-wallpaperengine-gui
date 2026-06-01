@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+/// Top-level IPC message envelope.
+/// All communication between GUI and tray uses newline-delimited JSON
+/// with a `msg_type` discriminator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "msg_type")]
+pub enum IpcMessage {
+    #[serde(rename = "request")]
+    Request(IpcRequest),
+    #[serde(rename = "response")]
+    Response(IpcResponse),
+    #[serde(rename = "event")]
+    Event(IpcEvent),
+}
+
 /// A request from GUI to tray daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcRequest {
@@ -25,6 +39,8 @@ pub enum IpcCommand {
     },
     /// Stop the currently running wallpaper
     StopWallpaper,
+    /// Notify tray that GUI is closing cleanly
+    GuiClosing,
     /// Shutdown the tray daemon (and stop wallpaper)
     Quit,
 }
@@ -40,6 +56,14 @@ pub struct IpcResponse {
     pub data: Option<serde_json::Value>,
 }
 
+/// Push event from tray to GUI (unsolicited)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcEvent {
+    pub event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
 /// Status information from the tray daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrayStatus {
@@ -47,6 +71,8 @@ pub struct TrayStatus {
     pub current_wallpaper_title: Option<String>,
     pub gui_running: bool,
 }
+
+// ── Constructors ───────────────────────────────────────────────────────────
 
 impl IpcRequest {
     pub fn new(id: u64, cmd: IpcCommand) -> Self {
@@ -69,6 +95,22 @@ impl IpcResponse {
             id,
             ok: false,
             error: Some(error.into()),
+            data: None,
+        }
+    }
+}
+
+impl IpcEvent {
+    pub fn status_changed(status: &TrayStatus) -> Self {
+        Self {
+            event: "status_changed".into(),
+            data: Some(serde_json::to_value(status).unwrap_or_default()),
+        }
+    }
+
+    pub fn show_window() -> Self {
+        Self {
+            event: "show_window".into(),
             data: None,
         }
     }

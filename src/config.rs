@@ -110,6 +110,37 @@ impl Default for MpvpaperParams {
     }
 }
 
+/// Auto-start wallpaper configuration
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutoStart {
+    /// Whether to auto-apply a wallpaper on daemon startup
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Full path to the wallpaper file (scene.pkg or video file)
+    #[serde(default)]
+    pub file_path: String,
+
+    /// Display title for the wallpaper
+    #[serde(default)]
+    pub title: String,
+
+    /// "scene" or "video"
+    #[serde(default)]
+    pub wallpaper_type: String,
+}
+
+impl Default for AutoStart {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            file_path: String::new(),
+            title: String::new(),
+            wallpaper_type: String::new(),
+        }
+    }
+}
+
 /// Application configuration persisted to disk (TOML format)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
@@ -124,6 +155,10 @@ pub struct Config {
     /// mpvpaper parameters
     #[serde(default)]
     pub mpvpaper: MpvpaperParams,
+
+    /// Auto-start wallpaper (applied when daemon starts)
+    #[serde(default)]
+    pub auto_start: AutoStart,
 }
 
 impl Default for Config {
@@ -132,6 +167,7 @@ impl Default for Config {
             steamapps_path: String::new(),
             engine: EngineParams::default(),
             mpvpaper: MpvpaperParams::default(),
+            auto_start: AutoStart::default(),
         }
     }
 }
@@ -203,19 +239,19 @@ impl Config {
     }
 
     /// steamapps/common/wallpaper_engine/assets (for texture fallback)
+    /// Path to the Wallpaper Engine assets directory (shaders, fonts, etc.).
+    /// Does NOT check if the directory exists — the wallpaper engine binary
+    /// needs this path regardless.
     pub fn assets_path(&self) -> Option<PathBuf> {
         if self.steamapps_path.is_empty() {
             return None;
         }
-        let p = PathBuf::from(&self.steamapps_path)
-            .join("common")
-            .join("wallpaper_engine")
-            .join("assets");
-        if p.is_dir() {
-            Some(p)
-        } else {
-            None
-        }
+        Some(
+            PathBuf::from(&self.steamapps_path)
+                .join("common")
+                .join("wallpaper_engine")
+                .join("assets"),
+        )
     }
 
     /// Path to the IPC socket
@@ -234,5 +270,48 @@ impl Config {
         std::fs::create_dir_all(&path).ok();
         path.push("ipc-info.json");
         path
+    }
+
+    /// Lock file written by the GUI on startup (contains PID).
+    /// The tray reads this to detect an already-running GUI.
+    pub fn gui_lock_path() -> PathBuf {
+        let mut path = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        path.push("linux-wallpaperengine-gui");
+        std::fs::create_dir_all(&path).ok();
+        path.push("gui-lock.json");
+        path
+    }
+
+    /// Check whether the PID stored in the GUI lock file is still alive.
+    /// Returns Some(pid) if alive, None otherwise.
+    pub fn check_gui_alive() -> Option<u32> {
+        let path = Self::gui_lock_path();
+        let content = std::fs::read_to_string(&path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let pid = v["pid"].as_u64()? as u32;
+        // Check /proc/<pid> — if it exists the process is alive
+        let proc_path = std::path::PathBuf::from(format!("/proc/{}", pid));
+        if proc_path.exists() {
+            Some(pid)
+        } else {
+            // Stale lock file — clean up
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+
+    /// Write the GUI lock file with current PID.
+    pub fn write_gui_lock() {
+        let path = Self::gui_lock_path();
+        let pid = std::process::id();
+        let json = serde_json::json!({"pid": pid});
+        if let Ok(s) = serde_json::to_string(&json) {
+            let _ = std::fs::write(&path, s);
+        }
+    }
+
+    /// Remove the GUI lock file on clean shutdown.
+    pub fn remove_gui_lock() {
+        let _ = std::fs::remove_file(Self::gui_lock_path());
     }
 }

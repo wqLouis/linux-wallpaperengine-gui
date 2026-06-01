@@ -17,6 +17,7 @@ pub const ACCENT_MUTED: Color = Color::from_rgb(0.325, 0.149, 0.600); // #532699
 
 pub const SUCCESS: Color = Color::from_rgb(0.133, 0.773, 0.369);    // #22c55e
 pub const ERROR: Color = Color::from_rgb(0.937, 0.267, 0.267);      // #ef4444
+pub const WARNING: Color = Color::from_rgb(0.957, 0.643, 0.102);    // #f4a40f
 
 pub const TEXT_PRIMARY: Color = Color::from_rgb(0.925, 0.933, 0.973); // #ecedf8
 pub const TEXT_SECONDARY: Color = Color::from_rgb(0.631, 0.651, 0.714); // #a1a6b6
@@ -27,6 +28,7 @@ pub const BORDER_SUBTLE: Color = Color::from_rgb(0.165, 0.165, 0.208); // #2a2a3
 
 // ── Border radii ───────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub const R_SM: f32 = 6.0;
 pub const R_MD: f32 = 10.0;
 pub const R_LG: f32 = 14.0;
@@ -237,13 +239,27 @@ pub fn surface_style(_theme: &iced::Theme) -> container::Style {
 pub fn top_bar_style(_theme: &iced::Theme) -> container::Style {
     container::Style {
         text_color: Some(TEXT_PRIMARY),
-        background: Some(Background::Color(Color::from_rgba(0.078, 0.078, 0.106, 0.92))),
-        border: Border { color: BORDER_SUBTLE, width: 0.0, radius: 0.0.into() },
-        shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
-            offset: Vector::new(0.0, 1.0),
-            blur_radius: 12.0,
+        background: Some(Background::Color(Color::from_rgba(0.078, 0.078, 0.106, 0.95))),
+        border: Border {
+            color: BORDER_SUBTLE,
+            width: 0.0,
+            radius: 0.0.into(),
         },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 16.0,
+        },
+        snap: false,
+    }
+}
+
+pub fn app_background(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        text_color: Some(TEXT_PRIMARY),
+        background: Some(Background::Color(BG_DEEP)),
+        border: border_none(),
+        shadow: shadow_none(),
         snap: false,
     }
 }
@@ -252,7 +268,11 @@ pub fn preview_container(_theme: &iced::Theme) -> container::Style {
     container::Style {
         text_color: Some(TEXT_MUTED),
         background: Some(Background::Color(BG_ELEVATED)),
-        border: Border { color: Color::TRANSPARENT, width: 0.0, radius: R_SM.into() },
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: R_MD.into(),
+        },
         shadow: shadow_none(),
         snap: false,
     }
@@ -312,7 +332,7 @@ pub fn scrollable_style(_theme: &iced::Theme, _status: scrollable::Status) -> sc
             background: Some(Background::Color(Color::TRANSPARENT)),
             border: border_none(),
             scroller: scrollable::Scroller {
-                background: Background::Color(Color::from_rgba(0.506, 0.227, 0.929, 0.25)),
+                background: Background::Color(Color::from_rgba(0.506, 0.227, 0.929, 0.45)),
                 border: Border { color: Color::TRANSPARENT, width: 0.0, radius: R_FULL.into() },
             },
         },

@@ -21,7 +21,19 @@ fn main() {
     }
 }
 
-fn dark_theme(_: &GuiApp) -> iced::Theme { iced::Theme::Dark }
+fn dark_theme(_: &GuiApp) -> iced::Theme {
+    iced::Theme::custom(
+        "Wallpaper Engine",
+        iced::theme::Palette {
+            background: crate::theme::BG_DEEP,
+            text: crate::theme::TEXT_PRIMARY,
+            primary: crate::theme::ACCENT,
+            success: crate::theme::SUCCESS,
+            warning: crate::theme::WARNING,
+            danger: crate::theme::ERROR,
+        },
+    )
+}
 
 fn run_gui() {
     iced::application(GuiApp::new, GuiApp::update, GuiApp::view)

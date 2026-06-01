@@ -1,16 +1,38 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use iced::event;
 use iced::widget::{
-    Space, button, column, container, image, pick_list, row, scrollable, text, text_input, toggler,
+    pick_list, scrollable, text_input, button, column, container, image, row, text, toggler, Space,
 };
 use iced::window;
 use iced::{Alignment, Element, Length, Subscription, Task};
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::oneshot;
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use iced::futures::Stream;
+
+// ── Global IPC state for the reader subscription ───────────────────────────
+// Iced 0.14's Subscription::run_with requires D: Hash, so we store the
+// shared state in a OnceLock and pass a simple key.
+
+struct IpcGlobals {
+    writer: Arc<tokio::sync::Mutex<Option<OwnedWriteHalf>>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<IpcResponse>>>>,
+}
+
+static IPC_GLOBALS: OnceLock<IpcGlobals> = OnceLock::new();
 
 use crate::config::{Config, EngineParams, MpvpaperParams, ToolsStatus};
-use crate::ipc::{IpcCommand, IpcRequest, IpcResponse, TrayStatus};
+use crate::ipc::{IpcCommand, IpcEvent, IpcMessage, IpcRequest, IpcResponse, TrayStatus};
 use crate::theme;
 use crate::wallpaper::{Wallpaper, WallpaperType, discover_wallpapers};
+
+// ── App state ──────────────────────────────────────────────────────────────
 
 pub struct GuiApp {
     screen: Screen,
@@ -21,9 +43,13 @@ pub struct GuiApp {
     path_input: String,
     status_message: Option<String>,
     window_width: f32,
+    window_id: Option<window::Id>,
     ipc_connected: bool,
     next_request_id: u64,
-    pending_request: Option<(u64, PendingRequest)>,
+    /// Persistent IPC writer (shared with the reader task for send).
+    ipc_writer: Arc<tokio::sync::Mutex<Option<OwnedWriteHalf>>>,
+    /// Pending request ID → oneshot sender for response routing.
+    pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<IpcResponse>>>>,
     engine_mode: String,
     engine_fit_mode: String,
     engine_log_level: String,
@@ -31,13 +57,11 @@ pub struct GuiApp {
     engine_no_effects: bool,
     mpv_output: String,
     mpv_options_str: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum PendingRequest {
-    Status,
-    Apply,
-    Stop,
+    auto_start_enabled: bool,
+    auto_start_file_path: String,
+    auto_start_title: String,
+    auto_start_wallpaper_type: String,
+    last_applied_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,11 +87,25 @@ pub enum Message {
     ApplyWallpaper(usize),
     StopWallpaper,
     RefreshWallpapers,
-    IpcConnected(Result<(), String>),
+    /// A response was matched to a pending request.
     IpcResponseReceived(IpcResponse),
-    WindowResized(f32),
-    Tick,
+    /// Push event received from the tray.
+    IpcEvent(IpcEvent),
+    /// IPC connection established.
+    IpcConnected,
+    /// IPC connection lost.
+    IpcDisconnected,
+    WindowResized(window::Id, f32),
+    AutoStartToggled(bool),
+    SetCurrentAsAutoStart,
+    ClearAutoStart,
+    /// User clicked window close — notify tray then exit.
+    WindowCloseRequested,
+    /// Perform actual window close.
+    Exit,
 }
+
+// ── Constructor ────────────────────────────────────────────────────────────
 
 impl GuiApp {
     pub fn new() -> (Self, Task<Message>) {
@@ -84,6 +122,9 @@ impl GuiApp {
             discover_wallpapers(w, b)
         };
 
+        // Write lock file so the tray can detect us
+        Config::write_gui_lock();
+
         let app = Self {
             screen: Screen::Library,
             path_input: config.steamapps_path.clone(),
@@ -98,26 +139,32 @@ impl GuiApp {
             engine_no_effects: config.engine.no_effects,
             mpv_output: config.mpvpaper.output.clone(),
             mpv_options_str: config.mpvpaper.mpv_options.join(", "),
+            auto_start_enabled: config.auto_start.enabled,
+            auto_start_file_path: config.auto_start.file_path.clone(),
+            auto_start_title: config.auto_start.title.clone(),
+            auto_start_wallpaper_type: config.auto_start.wallpaper_type.clone(),
+            last_applied_type: None,
             config,
             tools,
             wallpapers,
             tray_status: empty_status,
             status_message: Some("Connecting to daemon…".into()),
             window_width: 1200.0,
+            window_id: None,
             ipc_connected: false,
             next_request_id: 1,
-            pending_request: None,
+            ipc_writer: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
         };
-        let task = Task::perform(async { connect_to_tray().await }, |r| match r {
-            Ok(_) => Message::IpcConnected(Ok(())),
-            Err(e) => Message::IpcConnected(Err(e)),
-        });
-        (app, task)
+
+        (app, Task::none())
     }
 
     pub fn title(&self) -> String {
         "Wallpaper Engine Manager".into()
     }
+
+    // ── Update ──────────────────────────────────────────────────────────
 
     pub fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
@@ -213,8 +260,14 @@ impl GuiApp {
                 };
                 let fp = wp.file_path.as_ref().unwrap().to_string_lossy().to_string();
                 let title = wp.title.clone();
-                let id = self.next_id();
-                self.pending_request = Some((id, PendingRequest::Apply));
+
+                self.last_applied_type = Some(match wp.wallpaper_type {
+                    WallpaperType::Scene => "scene",
+                    WallpaperType::Video => "video",
+                    WallpaperType::Unsupported => "",
+                }
+                .to_string());
+
                 self.status_message = Some(format!("Applying {}…", title));
                 let cmd = match wp.wallpaper_type {
                     WallpaperType::Scene => IpcCommand::ApplyScene {
@@ -227,18 +280,13 @@ impl GuiApp {
                     },
                     WallpaperType::Unsupported => return Task::none(),
                 };
-                return Task::perform(send_ipc(id, cmd), Message::IpcResponseReceived);
+                return self.ipc_request(cmd);
             }
             Message::StopWallpaper => {
                 if !self.ipc_connected {
                     return Task::none();
                 }
-                let id = self.next_id();
-                self.pending_request = Some((id, PendingRequest::Stop));
-                return Task::perform(
-                    send_ipc(id, IpcCommand::StopWallpaper),
-                    Message::IpcResponseReceived,
-                );
+                return self.ipc_request(IpcCommand::StopWallpaper);
             }
             Message::RefreshWallpapers => {
                 self.status_message = Some("Discovering…".into());
@@ -263,25 +311,39 @@ impl GuiApp {
                     },
                 );
             }
-            Message::IpcConnected(r) => match r {
-                Ok(()) => {
-                    self.ipc_connected = true;
-                    self.status_message = Some("Connected".into());
-                    let id = self.next_id();
-                    self.pending_request = Some((id, PendingRequest::Status));
-                    return Task::perform(
-                        send_ipc(id, IpcCommand::GetStatus),
-                        Message::IpcResponseReceived,
-                    );
+            Message::IpcConnected => {
+                self.ipc_connected = true;
+                self.status_message = Some("Connected".into());
+                // Request initial status now that we're connected
+                return self.ipc_request(IpcCommand::GetStatus);
+            }
+            Message::IpcDisconnected => {
+                self.ipc_connected = false;
+                self.status_message = Some("Disconnected — retrying…".into());
+                Task::none()
+            }
+            Message::IpcEvent(evt) => {
+                match evt.event.as_str() {
+                    "status_changed" => {
+                        if let Some(data) = evt.data {
+                            if let Ok(s) = serde_json::from_value::<TrayStatus>(data) {
+                                self.tray_status = s;
+                            }
+                        }
+                    }
+                    "show_window" => {
+                        // Tray wants us to come to the foreground
+                        if let Some(id) = self.window_id {
+                            return window::gain_focus(id);
+                        }
+                    }
+                    _ => {}
                 }
-                Err(e) => {
-                    self.ipc_connected = false;
-                    self.status_message = Some(format!("Daemon offline: {}", e));
-                    Task::none()
-                }
-            },
+                Task::none()
+            }
             Message::IpcResponseReceived(resp) => {
                 if resp.id == 0 {
+                    // Wallpaper list update from SaveSettings / RefreshWallpapers
                     if let Some(d) = resp.data {
                         if let Ok(wps) = serde_json::from_value::<Vec<Wallpaper>>(d) {
                             self.wallpapers = wps;
@@ -291,93 +353,212 @@ impl GuiApp {
                     }
                     return Task::none();
                 }
-                let (expected_id, pending) = match self.pending_request.take() {
-                    Some(p) => p,
-                    None => {
-                        if resp.ok {
-                            if let Some(d) = resp.data {
-                                if let Ok(s) = serde_json::from_value::<TrayStatus>(d) {
-                                    self.tray_status = s;
-                                }
-                            }
-                        }
-                        return Task::none();
-                    }
-                };
-                if resp.id != expected_id {
-                    return Task::none();
-                }
+
                 if !resp.ok {
+                    self.ipc_connected = false;
                     self.status_message =
-                        Some(format!("Error: {}", resp.error.unwrap_or_default()));
+                        Some(format!("IPC error: {}", resp.error.unwrap_or_default()));
                     return Task::none();
                 }
-                match pending {
-                    PendingRequest::Status => {
-                        if let Some(d) = resp.data {
-                            if let Ok(s) = serde_json::from_value::<TrayStatus>(d) {
-                                self.tray_status = s;
-                            }
-                        }
-                    }
-                    PendingRequest::Apply => {
-                        self.status_message = Some("Applied".into());
-                        let id = self.next_id();
-                        self.pending_request = Some((id, PendingRequest::Status));
-                        return Task::perform(
-                            send_ipc(id, IpcCommand::GetStatus),
-                            Message::IpcResponseReceived,
-                        );
-                    }
-                    PendingRequest::Stop => {
-                        self.status_message = Some("Stopped".into());
-                        self.tray_status.wallpaper_running = false;
-                        self.tray_status.current_wallpaper_title = None;
+
+                // Response data may carry updated tray status
+                if let Some(d) = resp.data {
+                    if let Ok(s) = serde_json::from_value::<TrayStatus>(d) {
+                        self.tray_status = s;
                     }
                 }
+
                 Task::none()
             }
-            Message::WindowResized(w) => {
+            Message::WindowResized(id, w) => {
+                self.window_id = Some(id);
                 self.window_width = w;
                 Task::none()
             }
-            Message::Tick => {
-                if self.ipc_connected && self.pending_request.is_none() {
-                    let id = self.next_id();
-                    self.pending_request = Some((id, PendingRequest::Status));
-                    return Task::perform(
-                        send_ipc(id, IpcCommand::GetStatus),
-                        Message::IpcResponseReceived,
-                    );
+            Message::AutoStartToggled(v) => {
+                self.auto_start_enabled = v;
+                Task::none()
+            }
+            Message::SetCurrentAsAutoStart => {
+                let matched =
+                    self.tray_status
+                        .current_wallpaper_title
+                        .as_ref()
+                        .and_then(|title| {
+                            self.wallpapers.iter().find(|w| w.title == *title).map(|wp| {
+                                let fp = wp
+                                    .file_path
+                                    .as_ref()
+                                    .map(|p| p.to_string_lossy().to_string());
+                                let wt = match wp.wallpaper_type {
+                                    WallpaperType::Scene => "scene",
+                                    WallpaperType::Video => "video",
+                                    WallpaperType::Unsupported => "",
+                                };
+                                (fp, wt, wp.title.clone())
+                            })
+                        });
+
+                match matched {
+                    Some((Some(fp), wt, title)) if !wt.is_empty() => {
+                        self.auto_start_enabled = true;
+                        self.auto_start_file_path = fp;
+                        self.auto_start_title = title;
+                        self.auto_start_wallpaper_type = wt.to_string();
+
+                        let mut cfg = self.build_config();
+                        cfg.auto_start.enabled = true;
+                        cfg.auto_start.file_path = self.auto_start_file_path.clone();
+                        cfg.auto_start.title = self.auto_start_title.clone();
+                        cfg.auto_start.wallpaper_type = self.auto_start_wallpaper_type.clone();
+                        cfg.save();
+                        self.config = cfg;
+                        self.status_message = Some("Auto-start saved".into());
+                    }
+                    _ => {
+                        self.status_message =
+                            Some("No wallpaper currently running or not found in library".into());
+                    }
                 }
                 Task::none()
+            }
+            Message::ClearAutoStart => {
+                self.auto_start_enabled = false;
+                self.auto_start_file_path.clear();
+                self.auto_start_title.clear();
+                self.auto_start_wallpaper_type.clear();
+
+                let mut cfg = self.build_config();
+                cfg.auto_start = crate::config::AutoStart::default();
+                cfg.save();
+                self.config = cfg;
+                self.status_message = Some("Auto-start cleared".into());
+                Task::none()
+            }
+            Message::WindowCloseRequested => {
+                // Notify the tray we're closing, then exit
+                let writer = self.ipc_writer.clone();
+                return Task::perform(
+                    async move {
+                        let mut guard = writer.lock().await;
+                        if let Some(ref mut w) = *guard {
+                            let req = IpcRequest::new(0, IpcCommand::GuiClosing);
+                            let msg = IpcMessage::Request(req);
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = w.write_all((json + "\n").as_bytes()).await;
+                            }
+                        }
+                        Config::remove_gui_lock();
+                    },
+                    |_| Message::Exit,
+                );
+            }
+            Message::Exit => {
+                if let Some(id) = self.window_id {
+                    return window::close(id);
+                }
+                // Fallback: try with a unique ID (may not work, but best effort)
+                return window::close(window::Id::unique());
             }
         }
     }
 
+    // ── Subscriptions ───────────────────────────────────────────────────
+
     pub fn subscription(&self) -> Subscription<Message> {
+        // Store globals for the IPC reader stream to access
+        let _ = IPC_GLOBALS.set(IpcGlobals {
+            writer: self.ipc_writer.clone(),
+            pending: self.pending_requests.clone(),
+        });
+
         Subscription::batch([
-            event::listen_with(|ev, _, _| {
+            event::listen_with(|ev, _, id| {
                 if let iced::Event::Window(window::Event::Resized(s)) = ev {
-                    Some(Message::WindowResized(s.width))
+                    Some(Message::WindowResized(id, s.width))
+                } else if let iced::Event::Window(window::Event::CloseRequested) = ev {
+                    Some(Message::WindowCloseRequested)
                 } else {
                     None
                 }
             }),
-            iced::time::every(std::time::Duration::from_secs(3)).map(|_| Message::Tick),
+            // Persistent IPC reader — connects, reads events/responses, reconnects on failure
+            iced::Subscription::run_with(
+                0u64,
+                ipc_reader_stream,
+            ),
         ])
     }
 
+    // ── View ────────────────────────────────────────────────────────────
+
     pub fn view(&self) -> Element<'_, Message> {
-        column![
-            self.top_bar(),
-            match self.screen {
-                Screen::Library => self.library_view(),
-                Screen::Settings => self.settings_view(),
-            }
-        ]
+        container(
+            column![
+                self.top_bar(),
+                match self.screen {
+                    Screen::Library => self.library_view(),
+                    Screen::Settings => self.settings_view(),
+                }
+            ],
+        )
+        .style(theme::app_background)
+        .width(Length::Fill)
+        .height(Length::Fill)
         .into()
     }
+
+    // ── IPC helper ──────────────────────────────────────────────────────
+
+    /// Queue an IPC request over the persistent connection.
+    /// Returns a Task that resolves to IpcResponseReceived.
+    fn ipc_request(&mut self, cmd: IpcCommand) -> Task<Message> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let writer = self.ipc_writer.clone();
+        let pending = self.pending_requests.clone();
+
+        Task::perform(
+            async move {
+                let (tx, rx) = oneshot::channel();
+                pending.lock().unwrap().insert(id, tx);
+
+                let req = IpcRequest::new(id, cmd);
+                let msg = IpcMessage::Request(req);
+                let Ok(json) = serde_json::to_string(&msg) else {
+                    pending.lock().unwrap().remove(&id);
+                    return IpcResponse::err(id, "serialize failed");
+                };
+
+                let mut guard = writer.lock().await;
+                match &mut *guard {
+                    Some(w) => {
+                        if w.write_all((json + "\n").as_bytes()).await.is_err() {
+                            pending.lock().unwrap().remove(&id);
+                            return IpcResponse::err(id, "write failed");
+                        }
+                    }
+                    None => {
+                        pending.lock().unwrap().remove(&id);
+                        return IpcResponse::err(id, "not connected");
+                    }
+                }
+                drop(guard);
+
+                match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(_)) => IpcResponse::err(id, "channel closed"),
+                    Err(_) => {
+                        pending.lock().unwrap().remove(&id);
+                        IpcResponse::err(id, "timeout")
+                    }
+                }
+            },
+            Message::IpcResponseReceived,
+        )
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────
 
     fn sync_form(&mut self) {
         self.path_input = self.config.steamapps_path.clone();
@@ -393,6 +574,10 @@ impl GuiApp {
         self.engine_no_effects = self.config.engine.no_effects;
         self.mpv_output = self.config.mpvpaper.output.clone();
         self.mpv_options_str = self.config.mpvpaper.mpv_options.join(", ");
+        self.auto_start_enabled = self.config.auto_start.enabled;
+        self.auto_start_file_path = self.config.auto_start.file_path.clone();
+        self.auto_start_title = self.config.auto_start.title.clone();
+        self.auto_start_wallpaper_type = self.config.auto_start.wallpaper_type.clone();
     }
 
     fn build_config(&self) -> Config {
@@ -415,13 +600,13 @@ impl GuiApp {
                     .filter(|s| !s.is_empty())
                     .collect(),
             },
+            auto_start: crate::config::AutoStart {
+                enabled: self.auto_start_enabled,
+                file_path: self.auto_start_file_path.clone(),
+                title: self.auto_start_title.clone(),
+                wallpaper_type: self.auto_start_wallpaper_type.clone(),
+            },
         }
-    }
-
-    fn next_id(&mut self) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        id
     }
 
     // ── Top bar ─────────────────────────────────────────────────────────
@@ -566,7 +751,8 @@ impl GuiApp {
                 image(p.clone())
                     .width(Length::Fixed(w))
                     .height(Length::Fixed(w))
-                    .content_fit(iced::ContentFit::Cover),
+                    .content_fit(iced::ContentFit::Cover)
+                    .border_radius(theme::R_MD),
             )
             .width(Length::Fixed(w))
             .height(Length::Fixed(w))
@@ -700,7 +886,6 @@ impl GuiApp {
         } else {
             "❌ mpvpaper not found"
         };
-        // Effects toggle button
         let effects_label = if self.engine_no_effects {
             "Effects: Off"
         } else {
@@ -715,7 +900,6 @@ impl GuiApp {
 
         scrollable(
             column![
-                // ── Steam path ──
                 self.section(
                     "Steam Library",
                     column![
@@ -736,7 +920,6 @@ impl GuiApp {
                     .width(w.clone())
                 ),
                 Space::new().height(20),
-                // ── Engine ──
                 self.section(
                     "linux-wallpaper-engine",
                     column![
@@ -745,9 +928,7 @@ impl GuiApp {
                             Space::new().width(16),
                             container(self.dropdown("Fit Mode", FIT_MODES, &self.engine_fit_mode, Message::EngineFitModeChanged)).width(hf),
                         ].spacing(8),
-
                         Space::new().height(14),
-
                         row![
                             container(self.dropdown("Log Level", LOG_LEVELS, &self.engine_log_level, Message::EngineLogLevelChanged)).width(hf),
                             Space::new().width(16),
@@ -773,7 +954,6 @@ impl GuiApp {
                     .width(w.clone())
                 ),
                 Space::new().height(20),
-                // ── mpvpaper ──
                 self.section(
                     "mpvpaper",
                     column![
@@ -800,7 +980,53 @@ impl GuiApp {
                     .width(w.clone())
                 ),
                 Space::new().height(20),
-                // ── Tools ──
+                self.section(
+                    "Auto-Start",
+                    column![
+                        row![
+                            toggler(self.auto_start_enabled)
+                                .on_toggle(Message::AutoStartToggled),
+                            text("Apply wallpaper on daemon startup").size(13),
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                        Space::new().height(8),
+                        if self.auto_start_enabled && !self.auto_start_title.is_empty() {
+                            column![
+                                text(format!("Wallpaper: {}", self.auto_start_title)).size(12),
+                                text(format!("Path: {}", self.auto_start_file_path))
+                                    .size(10)
+                                    .style(|_| iced::widget::text::Style {
+                                        color: Some(theme::TEXT_MUTED),
+                                    }),
+                                Space::new().height(8),
+                                row![
+                                    button("Set to Current Wallpaper")
+                                        .style(theme::btn_primary)
+                                        .on_press(Message::SetCurrentAsAutoStart),
+                                    Space::new().width(8),
+                                    button("Clear")
+                                        .style(theme::btn_secondary)
+                                        .on_press(Message::ClearAutoStart),
+                                ]
+                                .spacing(8),
+                            ]
+                            .spacing(4)
+                        } else {
+                            column![
+                                text("No auto-start wallpaper configured.").size(12),
+                                Space::new().height(8),
+                                button("Set to Current Wallpaper")
+                                    .style(theme::btn_primary)
+                                    .on_press(Message::SetCurrentAsAutoStart),
+                            ]
+                            .spacing(4)
+                        }
+                    ]
+                    .spacing(4)
+                    .width(w.clone())
+                ),
+                Space::new().height(20),
                 self.section(
                     "Tools",
                     column![
@@ -881,39 +1107,127 @@ impl GuiApp {
     }
 }
 
-// ── IPC ──────────────────────────────────────────────────────────────────
+// ── Persistent IPC reader stream ───────────────────────────────────────────
 
-async fn connect_to_tray() -> Result<UnixStream, String> {
+/// Wraps a `tokio::sync::mpsc::Receiver` as an Iced-compatible `Stream`.
+struct TokioMpscStream<T> {
+    rx: tokio::sync::mpsc::Receiver<T>,
+}
+
+impl<T> Stream for TokioMpscStream<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+/// Creates a subscription stream that connects to the tray IPC socket,
+/// reads incoming messages (responses routed via oneshot channels,
+/// events forwarded as `Message::IpcEvent`), and reconnects on failure.
+fn ipc_reader_stream(_key: &u64) -> TokioMpscStream<Message> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+
+    let g = IPC_GLOBALS.get().expect("IPC_GLOBALS not set");
+    let writer = g.writer.clone();
+    let pending = g.pending.clone();
+
+    // Spawn the persistent reader task on the Tokio runtime.
+    // It connects, reads events/responses, and reconnects on failure.
+    tokio::spawn(async move {
+        loop {
+            // Connect to tray
+            match connect_to_tray().await {
+                Ok((reader, write_half)) => {
+                    // Store the write half so update() can send requests
+                    *writer.lock().await = Some(write_half);
+                    let _ = tx.send(Message::IpcConnected).await;
+
+                    let mut reader = BufReader::new(reader);
+                    let mut line = String::new();
+
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) => break, // EOF — connection closed
+                            Ok(_) => {
+                                let trimmed = line.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                let Ok(msg) =
+                                    serde_json::from_str::<IpcMessage>(trimmed)
+                                else {
+                                    continue;
+                                };
+                                match msg {
+                                    IpcMessage::Response(resp) => {
+                                        // Route to the waiting oneshot
+                                        if let Some(tx_oneshot) =
+                                            pending.lock().unwrap().remove(&resp.id)
+                                        {
+                                            let _ = tx_oneshot.send(resp);
+                                        }
+                                    }
+                                    IpcMessage::Event(evt) => {
+                                        if tx.send(Message::IpcEvent(evt)).await.is_err() {
+                                            return; // App shutting down
+                                        }
+                                    }
+                                    IpcMessage::Request(_) => {
+                                        // GUI doesn't handle requests
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("IPC read error: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("IPC connect failed: {e}");
+                }
+            }
+
+            // Connection lost — reset and retry
+            *writer.lock().await = None;
+            if tx.send(Message::IpcDisconnected).await.is_err() {
+                return; // App shutting down
+            }
+
+            // Wait before retrying
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+
+    TokioMpscStream { rx }
+}
+
+/// Synchronously connect to the tray's Unix socket.
+/// Blocks for at most 3 seconds.
+async fn connect_to_tray() -> Result<(OwnedReadHalf, OwnedWriteHalf), String> {
+    // 1. Read socket info file
     let info_path = Config::socket_info_path();
     let info_str = tokio::fs::read_to_string(&info_path)
         .await
-        .map_err(|e| format!("Cannot read socket info: {}", e))?;
+        .map_err(|e| format!("Cannot read socket info: {e}"))?;
     let info: serde_json::Value =
-        serde_json::from_str(&info_str).map_err(|e| format!("Invalid socket info: {}", e))?;
-    let socket_path = info["socket_path"].as_str().ok_or("No socket_path")?;
-    UnixStream::connect(socket_path)
-        .await
-        .map_err(|e| format!("Cannot connect: {}", e))
-}
+        serde_json::from_str(&info_str).map_err(|e| format!("Invalid socket info: {e}"))?;
+    let socket_path = info["socket_path"]
+        .as_str()
+        .ok_or("No socket_path in info")?
+        .to_string();
 
-async fn send_ipc(id: u64, cmd: IpcCommand) -> IpcResponse {
-    let stream = match connect_to_tray().await {
-        Ok(s) => s,
-        Err(e) => return IpcResponse::err(id, e),
-    };
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let req = IpcRequest::new(id, cmd);
-    let json = serde_json::to_string(&req).unwrap() + "\n";
-    if writer.write_all(json.as_bytes()).await.is_err() {
-        return IpcResponse::err(id, "Send failed");
-    }
-    line.clear();
-    match reader.read_line(&mut line).await {
-        Ok(0) => IpcResponse::err(id, "Connection closed"),
-        Ok(_) => serde_json::from_str(line.trim())
-            .unwrap_or_else(|e| IpcResponse::err(id, format!("Parse: {}", e))),
-        Err(e) => IpcResponse::err(id, format!("Read: {}", e)),
-    }
+    // 2. Connect with timeout
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::UnixStream::connect(&socket_path),
+    )
+    .await
+    .map_err(|_| "Connect timed out".to_string())?
+    .map_err(|e| format!("Cannot connect: {e}"))?;
+
+    Ok(stream.into_split())
 }
