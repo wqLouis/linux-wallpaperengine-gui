@@ -1,4 +1,5 @@
 mod config;
+mod displays;
 mod gui;
 mod ipc;
 mod theme;

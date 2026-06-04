@@ -5,7 +5,8 @@ A modern GUI manager for [linux-wallpaperengine](https://github.com/0xFA11/linux
 ## Features
 
 - **Library browser** — discover and preview all your Wallpaper Engine wallpapers (both Steam Workshop and built-in)
-- **One-click apply** — launch scene wallpapers via `linux-wallpaper-engine` or video wallpapers via `mpvpaper`
+- **One-click apply** — launch scene wallpapers via `linux-wallpaper-engine` (Rust) or `linux-wallpaperengine` (C++), or video wallpapers via `mpvpaper`
+- **Engine picker** — choose between the Rust and C++ wallpaper engines in Settings, with engine-specific options shown conditionally
 - **System tray** — runs as a background daemon with a tray icon for quick access
 - **Full settings** — configure all engine parameters (output mode, fit mode, log level, target FPS, effects, mpv options)
 - **Dark theme** — custom-styled interface with accent colors, card shadows, and modern typography
@@ -77,10 +78,19 @@ Settings are stored at `~/.config/linux-wallpaperengine-gui/config.toml`:
 
 ```toml
 steamapps_path = "/home/user/.steam/steam/steamapps"
+engine_rust_binary = "linux-wallpaper-engine"
+engine_cpp_binary = "linux-wallpaperengine"
+mpvpaper_binary = "mpvpaper"
 
 [engine]
-mode = "wlr"
-fit_mode = "cover"
+variant = "rust"            # "rust" (linux-wallpaper-engine) or "cpp" (linux-wallpaperengine)
+mode = "wlr"                # rust only
+fit_mode = "cover"          # rust only
+scaling = "default"         # cpp only
+screen_root = "*"           # cpp only, e.g. "eDP-1"; "*" = all connected displays
+silent = false              # cpp only
+disable_mouse = false       # cpp only
+disable_parallax = false    # cpp only
 log_level = "warning"
 target_fps = 60
 no_effects = false
@@ -90,7 +100,36 @@ output = "*"
 mpv_options = ["loop"]
 ```
 
-Configured via the Settings tab in the GUI.
+### Choosing an engine
+
+The GUI's Settings tab has a segmented picker at the top of the engine
+section to choose between the two backends:
+
+- **linux-wallpaper-engine (Rust)** — the Rust port. Uses `-p`, `-m`,
+  `--fit-mode`, `-l`, `--no-effects`, `--target-fps`, `--assets-path`.
+- **linux-wallpaperengine (C++)** — Almamu's C++ original. Uses
+  `--screen-root` (auto-detected from `wlr-randr` / `xrandr` when set
+  to `*`), `--bg` to assign the wallpaper, plus `--scaling`, `--fps`,
+  `--silent`, `--disable-mouse`, `--disable-parallax`, `--assets-dir`.
+  The path is the *project directory* (containing `project.json` and
+  `scene.pkg`), not the `.pkg` file itself.
+
+Both binary paths are stored independently, so switching variants never
+loses a custom path. Common options (target FPS, log level) apply to
+both.
+
+### Video wallpapers
+
+Video wallpapers are routed through the C++ engine (`linux-wallpaperengine`)
+whenever it is installed, regardless of which variant is selected for
+scene wallpapers. The C++ engine has its own `VideoPlayback/MPV`
+subsystem and integrates with the same display / `--bg` plumbing as
+scene wallpapers, so all the same per-screen options (scaling, FPS,
+silent, etc.) apply.
+
+If the C++ engine is not installed, the tray falls back to `mpvpaper`
+with the configured display output and `mpv_options` from the Settings
+tab.
 
 ## License
 

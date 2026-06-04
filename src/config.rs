@@ -1,23 +1,81 @@
 use std::path::PathBuf;
 
-/// Tool availability detected at startup
-#[derive(Debug, Clone)]
-pub struct ToolsStatus {
-    pub engine_available: bool,
-    pub mpvpaper_available: bool,
+/// Which backend implementation to invoke for scene wallpapers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EngineVariant {
+    /// `linux-wallpaper-engine` — the user's Rust port.
+    #[serde(rename = "rust")]
+    Rust,
+    /// `linux-wallpaperengine` — Almamu's C++ original.
+    #[serde(rename = "cpp")]
+    Cpp,
 }
 
-impl ToolsStatus {
-    pub fn detect() -> Self {
-        Self {
-            engine_available: which_bin("linux-wallpaper-engine"),
-            mpvpaper_available: which_bin("mpvpaper"),
+impl Default for EngineVariant {
+    fn default() -> Self {
+        EngineVariant::Rust
+    }
+}
+
+impl EngineVariant {
+    /// Default binary name for this variant.
+    #[allow(dead_code)]
+    pub fn default_binary(self) -> &'static str {
+        match self {
+            EngineVariant::Rust => "linux-wallpaper-engine",
+            EngineVariant::Cpp => "linux-wallpaperengine",
+        }
+    }
+
+    /// Human-readable label including the implementation family.
+    pub fn label(self) -> &'static str {
+        match self {
+            EngineVariant::Rust => "linux-wallpaper-engine (Rust)",
+            EngineVariant::Cpp => "linux-wallpaperengine (C++)",
         }
     }
 }
 
-/// Check if a binary exists in PATH or common locations
-fn which_bin(name: &str) -> bool {
+/// Tool availability detected at startup
+#[derive(Debug, Clone)]
+pub struct ToolsStatus {
+    /// `linux-wallpaper-engine` (Rust) is available, regardless of selection.
+    pub engine_rust_available: bool,
+    /// `linux-wallpaperengine` (C++) is available, regardless of selection.
+    pub engine_cpp_available: bool,
+    pub mpvpaper_available: bool,
+}
+
+impl ToolsStatus {
+    pub fn detect(
+        rust_bin: &str,
+        cpp_bin: &str,
+        mpvpaper_bin: &str,
+        _selected: EngineVariant,
+    ) -> Self {
+        Self {
+            engine_rust_available: which_bin(rust_bin),
+            engine_cpp_available: which_bin(cpp_bin),
+            mpvpaper_available: which_bin(mpvpaper_bin),
+        }
+    }
+
+    /// Convenience: was the binary for the currently selected variant found?
+    pub fn selected_available(&self, selected: EngineVariant) -> bool {
+        match selected {
+            EngineVariant::Rust => self.engine_rust_available,
+            EngineVariant::Cpp => self.engine_cpp_available,
+        }
+    }
+}
+
+/// Check if a binary exists in PATH or common locations.
+/// If `name` contains a path separator, treat it as an explicit path
+/// and only check that exact location.
+pub fn which_bin(name: &str) -> bool {
+    if name.contains('/') {
+        return PathBuf::from(name).is_file();
+    }
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(':') {
             let candidate = PathBuf::from(dir).join(name);
@@ -35,32 +93,63 @@ fn which_bin(name: &str) -> bool {
     false
 }
 
-/// Parameters for linux-wallpaper-engine CLI
+/// Parameters for the scene-wallpaper engine CLI.
+/// Fields are kept as a superset of both variants' CLIs; unused fields
+/// are simply ignored when invoking the other engine.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineParams {
-    /// Output mode (e.g. "wlr", "kms", "x11")
-    #[serde(default = "default_mode")]
-    pub mode: String,
+    /// Which backend to invoke.
+    #[serde(default)]
+    pub variant: EngineVariant,
 
-    /// How the wallpaper fits the screen: "cover", "contain", "fill", "stretch"
-    #[serde(default = "default_fit_mode")]
-    pub fit_mode: String,
-
+    // ── Common ───────────────────────────────────────────────────────────
     /// Log level: "error", "warning", "info", "debug", "trace"
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
-    /// Target FPS. None = render as fast as possible
+    /// Target FPS. None = render as fast as possible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_fps: Option<u32>,
 
-    /// Disable effects
+    /// Disable effects (Rust only — silently ignored by C++).
     #[serde(default)]
     pub no_effects: bool,
 
-    /// Use stdin for JSON config instead of CLI args
+    // ── Rust-only (`linux-wallpaper-engine`) ─────────────────────────────
+    /// Output mode (e.g. "wlr", "winit").
+    #[serde(default = "default_mode")]
+    pub mode: String,
+
+    /// How the wallpaper fits the screen: "cover", "contain", "stretch".
+    #[serde(default = "default_fit_mode")]
+    pub fit_mode: String,
+
+    /// Use stdin for JSON config instead of CLI args (Rust only).
     #[serde(default)]
     pub use_stdin: bool,
+
+    // ── C++-only (`linux-wallpaperengine`) ──────────────────────────────
+    /// Wallpaper scaling: "stretch", "fit", "fill", "default".
+    #[serde(default = "default_scaling")]
+    pub scaling: String,
+
+    /// Output display (e.g. "*", "eDP-1", "HDMI-A-1"). `*` = all
+    /// currently connected displays (auto-detected via wlr-randr /
+    /// xrandr). Anything else is passed verbatim to `--screen-root`.
+    #[serde(default = "default_screen_root")]
+    pub screen_root: String,
+
+    /// Mute background audio.
+    #[serde(default)]
+    pub silent: bool,
+
+    /// Disable mouse interaction.
+    #[serde(default)]
+    pub disable_mouse: bool,
+
+    /// Disable parallax effect.
+    #[serde(default)]
+    pub disable_parallax: bool,
 }
 
 fn default_mode() -> String {
@@ -72,15 +161,27 @@ fn default_fit_mode() -> String {
 fn default_log_level() -> String {
     "warning".to_string()
 }
+fn default_scaling() -> String {
+    "default".to_string()
+}
+fn default_screen_root() -> String {
+    "*".to_string()
+}
 impl Default for EngineParams {
     fn default() -> Self {
         Self {
-            mode: default_mode(),
-            fit_mode: default_fit_mode(),
+            variant: EngineVariant::default(),
             log_level: default_log_level(),
             target_fps: None,
             no_effects: false,
+            mode: default_mode(),
+            fit_mode: default_fit_mode(),
             use_stdin: false,
+            scaling: default_scaling(),
+            screen_root: default_screen_root(),
+            silent: false,
+            disable_mouse: false,
+            disable_parallax: false,
         }
     }
 }
@@ -148,7 +249,23 @@ pub struct Config {
     #[serde(default)]
     pub steamapps_path: String,
 
-    /// linux-wallpaper-engine parameters
+    /// Path or name of the Rust engine binary (`linux-wallpaper-engine`).
+    /// Falls back to the legacy `engine_binary` key for old configs.
+    #[serde(
+        default = "default_engine_rust_binary",
+        alias = "engine_binary"
+    )]
+    pub engine_rust_binary: String,
+
+    /// Path or name of the C++ engine binary (`linux-wallpaperengine`).
+    #[serde(default = "default_engine_cpp_binary")]
+    pub engine_cpp_binary: String,
+
+    /// Path or name of the mpvpaper binary
+    #[serde(default = "default_mpvpaper_binary")]
+    pub mpvpaper_binary: String,
+
+    /// Engine parameters (variant + per-variant CLI options)
     #[serde(default)]
     pub engine: EngineParams,
 
@@ -161,14 +278,45 @@ pub struct Config {
     pub auto_start: AutoStart,
 }
 
+fn default_engine_rust_binary() -> String {
+    "linux-wallpaper-engine".to_string()
+}
+fn default_engine_cpp_binary() -> String {
+    "linux-wallpaperengine".to_string()
+}
+fn default_mpvpaper_binary() -> String {
+    "mpvpaper".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             steamapps_path: String::new(),
+            engine_rust_binary: default_engine_rust_binary(),
+            engine_cpp_binary: default_engine_cpp_binary(),
+            mpvpaper_binary: default_mpvpaper_binary(),
             engine: EngineParams::default(),
             mpvpaper: MpvpaperParams::default(),
             auto_start: AutoStart::default(),
         }
+    }
+}
+
+impl Config {
+    /// Return the binary path/name for the currently selected engine variant.
+    pub fn engine_binary(&self) -> &str {
+        match self.engine.variant {
+            EngineVariant::Rust => &self.engine_rust_binary,
+            EngineVariant::Cpp => &self.engine_cpp_binary,
+        }
+    }
+
+    /// Whether the C++ engine binary (`linux-wallpaperengine`) is on PATH
+    /// or at the configured explicit location. Used to decide whether
+    /// video wallpapers can be routed through it before falling back to
+    /// mpvpaper.
+    pub fn cpp_engine_available(&self) -> bool {
+        which_bin(&self.engine_cpp_binary)
     }
 }
 
@@ -314,4 +462,130 @@ impl Config {
     pub fn remove_gui_lock() {
         let _ = std::fs::remove_file(Self::gui_lock_path());
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_variant_default_is_rust() {
+        assert_eq!(EngineVariant::default(), EngineVariant::Rust);
+        assert_eq!(EngineVariant::Rust.default_binary(), "linux-wallpaper-engine");
+        assert_eq!(EngineVariant::Cpp.default_binary(), "linux-wallpaperengine");
+    }
+
+    #[test]
+    fn engine_params_default_includes_cpp_fields() {
+        let p = EngineParams::default();
+        assert_eq!(p.variant, EngineVariant::Rust);
+        assert_eq!(p.scaling, "default");
+        assert_eq!(p.screen_root, "*", "screen_root should default to '*' (all)");
+        assert!(!p.silent);
+        assert!(!p.disable_mouse);
+        assert!(!p.disable_parallax);
+    }
+
+    #[test]
+    fn config_round_trip_preserves_cpp_variant() {
+        let cfg = Config {
+            steamapps_path: "/tmp/steam".into(),
+            engine_rust_binary: "/opt/rust/engine".into(),
+            engine_cpp_binary: "/opt/cpp/engine".into(),
+            mpvpaper_binary: "mpvpaper".into(),
+            engine: EngineParams {
+                variant: EngineVariant::Cpp,
+                scaling: "fill".into(),
+                screen_root: "eDP-1".into(),
+                silent: true,
+                target_fps: Some(30),
+                disable_parallax: true,
+                ..EngineParams::default()
+            },
+            mpvpaper: MpvpaperParams::default(),
+            auto_start: AutoStart::default(),
+        };
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.engine_rust_binary, "/opt/rust/engine");
+        assert_eq!(back.engine_cpp_binary, "/opt/cpp/engine");
+        assert_eq!(back.engine.variant, EngineVariant::Cpp);
+        assert_eq!(back.engine.scaling, "fill");
+        assert_eq!(back.engine.screen_root, "eDP-1");
+        assert!(back.engine.silent);
+        assert!(back.engine.disable_parallax);
+        assert_eq!(back.engine.target_fps, Some(30));
+        assert_eq!(back.engine_binary(), "/opt/cpp/engine");
+    }
+
+    #[test]
+    fn legacy_engine_binary_alias_loads_as_rust() {
+        // Old configs written before the per-variant split used a single
+        // `engine_binary` key. The serde alias should keep those working,
+        // treating the old key as the rust binary path.
+        let old = r#"
+            steamapps_path = "/x"
+            engine_binary = "/old/rust/path"
+            mpvpaper_binary = "mpv"
+        "#;
+        let parsed: Config = toml::from_str(old).unwrap();
+        assert_eq!(parsed.engine_rust_binary, "/old/rust/path");
+        assert_eq!(parsed.engine_cpp_binary, "linux-wallpaperengine");
+        assert_eq!(parsed.engine_binary(), "/old/rust/path");
+    }
+
+    #[test]
+    fn cpp_engine_binary_helper_switches_with_variant() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.engine_binary(), "linux-wallpaper-engine");
+        cfg.engine.variant = EngineVariant::Cpp;
+        assert_eq!(cfg.engine_binary(), "linux-wallpaperengine");
+        cfg.engine_cpp_binary = "/custom/cpp".into();
+        assert_eq!(cfg.engine_binary(), "/custom/cpp");
+    }
+}
+#[test]
+fn on_disk_round_trip() {
+    use std::fs;
+    let dir = std::env::temp_dir().join("lwpe-gui-smoke");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    let original = r#"
+steamapps_path = "/home/x/.steam/steam/steamapps"
+engine_rust_binary = "/custom/rust/path"
+engine_cpp_binary = "/custom/cpp/path"
+mpvpaper_binary = "mpvpaper"
+
+[engine]
+variant = "cpp"
+log_level = "debug"
+target_fps = 60
+no_effects = false
+mode = "wlr"
+fit_mode = "cover"
+use_stdin = false
+scaling = "fill"
+screen_root = "eDP-1"
+silent = true
+disable_mouse = true
+disable_parallax = false
+"#;
+    fs::write(&path, original).unwrap();
+    let s = fs::read_to_string(&path).unwrap();
+    let cfg: Config = toml::from_str(&s).unwrap();
+    assert_eq!(cfg.engine.variant, EngineVariant::Cpp);
+    assert_eq!(cfg.engine_rust_binary, "/custom/rust/path");
+    assert_eq!(cfg.engine_cpp_binary, "/custom/cpp/path");
+    assert_eq!(cfg.engine.scaling, "fill");
+    assert_eq!(cfg.engine.screen_root, "eDP-1");
+    assert!(cfg.engine.silent);
+    assert!(cfg.engine.disable_mouse);
+    assert!(!cfg.engine.disable_parallax);
+    assert_eq!(cfg.engine.target_fps, Some(60));
+    // Also verify that re-serializing gives a stable result
+    let out = toml::to_string_pretty(&cfg).unwrap();
+    let back: Config = toml::from_str(&out).unwrap();
+    assert_eq!(back.engine.variant, EngineVariant::Cpp);
+    assert_eq!(back.engine_cpp_binary, "/custom/cpp/path");
 }

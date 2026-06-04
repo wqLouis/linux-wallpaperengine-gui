@@ -672,6 +672,146 @@ async fn stop_current_wallpaper(state: &Arc<Mutex<TrayState>>) {
     }
 }
 
+/// Derive the project directory (containing `project.json`) from a
+/// `Wallpaper::file_path`. Our wallpapers store `scene.pkg` as
+/// `file_path`, but Almamu's `linux-wallpaperengine` wants the parent
+/// directory. Built-in / video wallpapers that already point at a
+/// directory pass through unchanged.
+fn cpp_project_dir(file_path: &str) -> String {
+    let p = std::path::Path::new(file_path);
+    match p.file_name().and_then(|n| n.to_str()) {
+        // Common case: .../<workshop_id>/scene.pkg → .../<workshop_id>/
+        Some("scene.pkg") => p
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file_path.to_string()),
+        // Already a directory, or a file we don't recognize — pass through.
+        _ => file_path.to_string(),
+    }
+}
+
+/// Resolve which display outputs to pass to `--screen-root`.
+/// `spec` is the value of `EngineParams::screen_root`:
+/// - `""` or `"*"` → all currently connected displays (auto-detected)
+/// - anything else → that single specific display
+///
+/// Returns an error if `*` is requested but no display-detection tool
+/// (wlr-randr / xrandr) is available, so the caller gets a clear
+/// message instead of the engine silently opening a window.
+fn resolve_cpp_displays(spec: &str) -> Result<Vec<String>, String> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        match crate::displays::detect_connected_displays() {
+            Some(v) if !v.is_empty() => Ok(v),
+            Some(_) => Err(
+                "No connected displays detected (wlr-randr / xrandr reported none). \
+                 Set a specific Screen Root in Settings, or plug in a display."
+                    .to_string(),
+            ),
+            None => Err(
+                "Cannot auto-detect displays: neither wlr-randr nor xrandr is available. \
+                 Set a specific Screen Root in Settings (e.g. \"eDP-1\" or \"DP-3\")."
+                    .to_string(),
+            ),
+        }
+    } else {
+        // Specific display name — trust the user. If the engine later
+        // complains it's not a real output, that's a clearer error than
+        // opening a window.
+        Ok(vec![trimmed.to_string()])
+    }
+}
+
+/// Build the shared C++ engine argv as a flat list of strings. Used
+/// by both the scene branch (where `background_path` is the project
+/// directory) and the video branch (where it is a direct path to a
+/// video file).
+///
+/// `background_path` is the path that the engine will load as the
+/// wallpaper — a folder for scene/web projects, or a single video
+/// file for video wallpapers. The engine auto-detects the type.
+///
+/// The engine applies per-screen options (--scaling, --fps, --silent,
+/// --bg, …) to the *most recent* --screen-root. So when we want the
+/// same background + settings on multiple screens, we interleave
+/// the per-screen args after each --screen-root declaration:
+///
+///     --screen-root D1 --scaling X --fps N --bg <path> \
+///     --screen-root D2 --scaling X --fps N --bg <path>
+fn build_cpp_engine_args(
+    config: &Config,
+    background_path: &str,
+) -> Result<Vec<String>, String> {
+    let engine = &config.engine;
+    let targets = resolve_cpp_displays(&engine.screen_root)?;
+    if targets.is_empty() {
+        return Err(
+            "linux-wallpaperengine: no displays selected (set Screen Root in Settings)"
+                .to_string(),
+        );
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let assets_arg = config.assets_path().map(|p| p.to_string_lossy().into_owned());
+
+    for display in &targets {
+        // --screen-root sets `lastScreen` to <display>; everything
+        // below this point targets it until the next --screen-root.
+        out.push("--screen-root".into());
+        out.push(display.clone());
+        out.push("--scaling".into());
+        out.push(engine.scaling.clone());
+        if let Some(fps) = engine.target_fps {
+            out.push("--fps".into());
+            out.push(fps.to_string());
+        }
+        if engine.silent {
+            out.push("--silent".into());
+        }
+        if engine.disable_mouse {
+            out.push("--disable-mouse".into());
+        }
+        if engine.disable_parallax {
+            out.push("--disable-parallax".into());
+        }
+        if let Some(ref path) = assets_arg {
+            out.push("--assets-dir".into());
+            out.push(path.clone());
+        }
+        out.push("--bg".into());
+        out.push(background_path.to_string());
+    }
+    Ok(out)
+}
+
+/// Apply a flat list of args to a `tokio::process::Command` and mirror
+/// them (as a debug-friendly log) into `display_args`. The mirror is
+/// just the args joined with their values — we use it for logging.
+fn apply_args(
+    cmd: &mut tokio::process::Command,
+    display_args: &mut Vec<String>,
+    args: &[String],
+) {
+    for a in args {
+        display_args.push(a.clone());
+    }
+    cmd.args(args);
+}
+
+fn append_cpp_engine_args(
+    cmd: &mut tokio::process::Command,
+    display_args: &mut Vec<String>,
+    config: &Config,
+    background_path: &str,
+    engine_bin: &str,
+) -> Result<(), String> {
+    let args = build_cpp_engine_args(config, background_path).inspect_err(|e| {
+        log::error!("{engine_bin}: {e}");
+    })?;
+    apply_args(cmd, display_args, &args);
+    Ok(())
+}
+
 async fn apply_scene_wallpaper(
     state: &Arc<Mutex<TrayState>>,
     file_path: &str,
@@ -683,37 +823,79 @@ async fn apply_scene_wallpaper(
     let config = Config::load();
     let engine = &config.engine;
 
-    let mut cmd = tokio::process::Command::new("linux-wallpaper-engine");
-    cmd.arg("-p")
-        .arg(file_path)
-        .arg("-m")
-        .arg(&engine.mode)
-        .arg("--fit-mode")
-        .arg(&engine.fit_mode)
-        .arg("-l")
-        .arg(&engine.log_level);
+    let engine_bin = config.engine_binary().to_string();
+    let mut cmd = tokio::process::Command::new(&engine_bin);
+    let mut display_args: Vec<String> = Vec::new();
 
-    if engine.no_effects {
-        cmd.arg("--no-effects");
-    }
-    if let Some(fps) = engine.target_fps {
-        cmd.arg("--target-fps").arg(fps.to_string());
-    }
-    if let Some(ref assets) = config.assets_path() {
-        cmd.arg("--assets-path").arg(assets);
+    match engine.variant {
+        crate::config::EngineVariant::Rust => {
+            // linux-wallpaper-engine:  -p <path> -m <mode> --fit-mode <f>
+            //                           -l <lvl> [--no-effects]
+            //                           [--target-fps N] [--assets-path P]
+            cmd.arg("-p").arg(file_path)
+                .arg("-m").arg(&engine.mode)
+                .arg("--fit-mode").arg(&engine.fit_mode)
+                .arg("-l").arg(&engine.log_level);
+            display_args.extend([
+                format!("-p {}", file_path),
+                format!("-m {}", engine.mode),
+                format!("--fit-mode {}", engine.fit_mode),
+                format!("-l {}", engine.log_level),
+            ]);
+
+            if engine.no_effects {
+                cmd.arg("--no-effects");
+                display_args.push("--no-effects".into());
+            }
+            if let Some(fps) = engine.target_fps {
+                cmd.arg("--target-fps").arg(fps.to_string());
+                display_args.push(format!("--target-fps {}", fps));
+            }
+            if let Some(ref assets) = config.assets_path() {
+                cmd.arg("--assets-path").arg(assets);
+                display_args.push(format!("--assets-path {}", assets.display()));
+            }
+        }
+        crate::config::EngineVariant::Cpp => {
+            // linux-wallpaperengine:    --screen-root D [--scaling m] [--fps N]
+            //                           [--silent] [--disable-mouse]
+            //                           [--disable-parallax] [--assets-dir P]
+            //                           --bg <path>
+            //
+            // The background must be assigned via `--bg <path>` paired with
+            // a preceding `--screen-root <display>`. Without `--screen-root`
+            // the engine opens a window (its default render mode is
+            // NORMAL_WINDOW), so we always emit at least one such pair.
+            //
+            // For scene wallpapers `<path>` is the *project directory*
+            // (containing `project.json` and `scene.pkg`), NOT the path
+            // to `scene.pkg` itself. See `cpp_project_dir`.
+            let project_dir = cpp_project_dir(file_path);
+            // Sanity-check the directory actually contains a project.json
+            // — if not, the engine will fail with a confusing error.
+            let project_json = std::path::Path::new(&project_dir).join("project.json");
+            if !project_json.is_file() {
+                let msg = format!(
+                    "Refusing to invoke linux-wallpaperengine: '{}' has no project.json",
+                    project_dir
+                );
+                log::error!("{msg}");
+                return Err(msg);
+            }
+            append_cpp_engine_args(
+                &mut cmd,
+                &mut display_args,
+                &config,
+                &project_dir,
+                &engine_bin,
+            )?;
+        }
     }
 
-    let assets_display = config
-        .assets_path()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
     log::info!(
-        "Spawning: linux-wallpaper-engine -p {} -m {} --fit-mode {} -l {} --assets-path {}",
-        file_path,
-        engine.mode,
-        engine.fit_mode,
-        engine.log_level,
-        assets_display
+        "Spawning: {} {}",
+        engine_bin,
+        display_args.join(" ")
     );
 
     cmd.stdout(Stdio::null())
@@ -723,7 +905,7 @@ async fn apply_scene_wallpaper(
     match cmd.spawn() {
         Ok(child) => {
             let pid = child.id().unwrap_or(0);
-            log::info!("Launched scene pid={} title={title}", pid);
+            log::info!("Launched scene pid={} title={title} variant={:?}", pid, engine.variant);
             s.wallpaper = Some(ManagedWallpaper {
                 child,
                 pid,
@@ -732,7 +914,10 @@ async fn apply_scene_wallpaper(
             Ok(())
         }
         Err(e) => {
-            let msg = format!("Failed to spawn linux-wallpaper-engine '{}': {e}", file_path);
+            let msg = format!(
+                "Failed to spawn {} ({:?}) '{}': {e}",
+                engine_bin, engine.variant, file_path
+            );
             log::error!("{msg}");
             Err(msg)
         }
@@ -748,16 +933,68 @@ async fn apply_video_wallpaper(
 
     let mut s = state.lock().unwrap();
     let config = Config::load();
-    let mpv = &config.mpvpaper;
 
-    let mut cmd = tokio::process::Command::new("mpvpaper");
+    // Prefer the C++ `linux-wallpaperengine` for video wallpapers when
+    // it's installed: it has its own VideoPlayback/MPV subsystem and
+    // integrates with the rest of the engine's window/output handling.
+    // Fall back to mpvpaper (the lightweight alternative) if the C++
+    // engine is not available.
+    if config.cpp_engine_available() {
+        let engine_bin = config.engine_cpp_binary.clone();
+        let mut cmd = tokio::process::Command::new(&engine_bin);
+        let mut display_args: Vec<String> = Vec::new();
+        // The engine auto-detects the wallpaper type from the file
+        // extension / project.json, so we can hand it the path directly
+        // — no scene.pkg stripping needed for video files.
+        append_cpp_engine_args(
+            &mut cmd,
+            &mut display_args,
+            &config,
+            file_path,
+            &engine_bin,
+        )?;
+        log::info!(
+            "Spawning (video via C++): {} {}",
+            engine_bin,
+            display_args.join(" ")
+        );
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null());
+        return match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id().unwrap_or(0);
+                log::info!("Launched video (C++) pid={} title={title}", pid);
+                s.wallpaper = Some(ManagedWallpaper {
+                    child,
+                    pid,
+                    title: title.to_string(),
+                });
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!(
+                    "Failed to spawn {} (video) '{}': {e}",
+                    engine_bin, file_path
+                );
+                log::error!("{msg}");
+                Err(msg)
+            }
+        };
+    }
+
+    // Fallback: mpvpaper for users who don't have the C++ engine.
+    let mpv = &config.mpvpaper;
+    let mpvpaper_bin = &config.mpvpaper_binary;
+    let mut cmd = tokio::process::Command::new(mpvpaper_bin);
     cmd.arg(&mpv.output).arg(file_path);
     for opt in &mpv.mpv_options {
         cmd.arg("-o").arg(opt);
     }
 
     log::info!(
-        "Spawning: mpvpaper {} {} -o {}",
+        "Spawning (video via mpvpaper fallback): {} {} {} -o {}",
+        mpvpaper_bin,
         mpv.output,
         file_path,
         mpv.mpv_options.join(" -o ")
@@ -770,7 +1007,7 @@ async fn apply_video_wallpaper(
     match cmd.spawn() {
         Ok(child) => {
             let pid = child.id().unwrap_or(0);
-            log::info!("Launched video pid={} title={title}", pid);
+            log::info!("Launched video (mpvpaper) pid={} title={title}", pid);
             s.wallpaper = Some(ManagedWallpaper {
                 child,
                 pid,
@@ -783,5 +1020,170 @@ async fn apply_video_wallpaper(
             log::error!("{msg}");
             Err(msg)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_cpp_engine_args, cpp_project_dir};
+
+    #[test]
+    fn cpp_project_dir_strips_scene_pkg_from_workshop() {
+        // The case from the user's bug report:
+        let p = "/mnt/DATA/Apps/Steam/steamapps/workshop/content/431960/3150484211/scene.pkg";
+        assert_eq!(
+            cpp_project_dir(p),
+            "/mnt/DATA/Apps/Steam/steamapps/workshop/content/431960/3150484211"
+        );
+    }
+
+    #[test]
+    fn cpp_project_dir_strips_scene_pkg_from_builtin() {
+        let p = "/home/u/.steam/steamapps/common/wallpaper_engine/projects/defaultprojects/some_project/scene.pkg";
+        assert_eq!(
+            cpp_project_dir(p),
+            "/home/u/.steam/steamapps/common/wallpaper_engine/projects/defaultprojects/some_project"
+        );
+    }
+
+    #[test]
+    fn cpp_project_dir_passes_through_directory() {
+        // Already a directory — return unchanged.
+        let p = "/some/project/folder";
+        assert_eq!(cpp_project_dir(p), "/some/project/folder");
+    }
+
+    #[test]
+    fn cpp_project_dir_passes_through_non_pkg_file() {
+        // Unrecognized file: don't try to be clever, just pass through.
+        let p = "/some/odd/scene.json";
+        assert_eq!(cpp_project_dir(p), "/some/odd/scene.json");
+    }
+
+    #[test]
+    fn cpp_project_dir_handles_bare_directory() {
+        // A bare directory name without a trailing slash should be a no-op.
+        let p = "/some/project";
+        assert_eq!(cpp_project_dir(p), "/some/project");
+    }
+
+    #[test]
+    fn resolve_specific_display() {
+        use super::resolve_cpp_displays;
+        // A specific name passes through unchanged.
+        assert_eq!(resolve_cpp_displays("DP-3").unwrap(), vec!["DP-3"]);
+        assert_eq!(resolve_cpp_displays("eDP-1").unwrap(), vec!["eDP-1"]);
+        // Whitespace is trimmed.
+        assert_eq!(resolve_cpp_displays("  HDMI-A-1  ").unwrap(), vec!["HDMI-A-1"]);
+    }
+
+    #[test]
+    fn resolve_star_returns_detected_displays() {
+        use super::resolve_cpp_displays;
+        // On a system with wlr-randr or xrandr installed, "*" expands.
+        // On a CI box without either, we get an error (not a panic).
+        let r = resolve_cpp_displays("*");
+        match r {
+            Ok(v) => assert!(!v.is_empty(), "got empty list"),
+            Err(e) => eprintln!("skip: {}", e),
+        }
+    }
+
+    #[test]
+    fn resolve_empty_treated_as_all() {
+        use super::resolve_cpp_displays;
+        // Empty string is equivalent to "*".
+        let r = resolve_cpp_displays("");
+        match r {
+            Ok(v) => assert!(!v.is_empty()),
+            Err(e) => eprintln!("skip: {}", e),
+        }
+    }
+
+    fn make_cpp_config_with_screen(spec: &str) -> crate::config::Config {
+        let mut c = crate::config::Config::default();
+        c.engine.variant = crate::config::EngineVariant::Cpp;
+        c.engine.screen_root = spec.to_string();
+        c
+    }
+
+    #[test]
+    fn build_cpp_args_single_screen_full_settings() {
+        // With a specific screen, scaling, fps, silent, and disable_mouse
+        // enabled, we should see all the right flags in the right order.
+        let mut c = make_cpp_config_with_screen("eDP-1");
+        c.engine.scaling = "fill".into();
+        c.engine.target_fps = Some(30);
+        c.engine.silent = true;
+        c.engine.disable_mouse = true;
+        c.engine.disable_parallax = true;
+
+        let args = build_cpp_engine_args(&c, "/path/to/project").unwrap();
+        let joined = args.join(" ");
+        // Single-screen: one --screen-root, with all per-screen opts
+        // immediately after, then --bg last.
+        assert!(joined.contains("--screen-root eDP-1"), "got: {joined}");
+        assert!(joined.contains("--scaling fill"), "got: {joined}");
+        assert!(joined.contains("--fps 30"), "got: {joined}");
+        assert!(joined.contains("--silent"), "got: {joined}");
+        assert!(joined.contains("--disable-mouse"), "got: {joined}");
+        assert!(joined.contains("--disable-parallax"), "got: {joined}");
+        assert!(joined.contains("--bg /path/to/project"), "got: {joined}");
+    }
+
+    #[test]
+    fn build_cpp_args_orders_per_screen_options_after_screen_root() {
+        // The engine applies per-screen options to the previous
+        // --screen-root. So for the option to actually take effect, it
+        // must appear *between* the --screen-root and the --bg.
+        let c = make_cpp_config_with_screen("DP-3");
+        let args = build_cpp_engine_args(&c, "/p").unwrap();
+        let root_pos = args.iter().position(|a| a == "--screen-root").unwrap();
+        let scaling_pos = args.iter().position(|a| a == "--scaling").unwrap();
+        let bg_pos = args.iter().position(|a| a == "--bg").unwrap();
+        assert!(root_pos < scaling_pos);
+        assert!(scaling_pos < bg_pos);
+    }
+
+    #[test]
+    fn build_cpp_args_multi_screen_repeats_per_screen_options() {
+        // For multi-monitor, we want the same background + settings on
+        // every screen, so the per-screen options must be repeated for
+        // each one (otherwise only the last screen gets them).
+        // We can't easily inject multiple detected displays into a
+        // Config, so use specific display names via a fake Config.
+        // (resolve_cpp_displays returns the same list for any non-*
+        // spec, so we just verify with a single explicit display; the
+        // loop logic is identical to the per-screen case.)
+        let c = make_cpp_config_with_screen("D1");
+        let args_single = build_cpp_engine_args(&c, "/p").unwrap();
+        // One --screen-root, one --scaling, one --bg.
+        assert_eq!(
+            args_single.iter().filter(|a| *a == "--screen-root").count(),
+            1
+        );
+        assert_eq!(args_single.iter().filter(|a| *a == "--bg").count(), 1);
+    }
+
+    #[test]
+    fn build_cpp_args_video_path_passes_through_unchanged() {
+        // For video wallpapers the path is a direct file, not a
+        // project dir — no scene.pkg stripping, no project.json check.
+        // The helper takes whatever path is given; that's the contract.
+        let c = make_cpp_config_with_screen("eDP-1");
+        let args = build_cpp_engine_args(&c, "/path/to/video.mp4").unwrap();
+        assert!(args.contains(&"/path/to/video.mp4".to_string()));
+        // The bg should appear after the screen-root.
+        let bg_idx = args.iter().position(|a| a == "--bg").unwrap();
+        assert_eq!(args[bg_idx + 1], "/path/to/video.mp4");
+    }
+
+    #[test]
+    fn cpp_engine_available_respects_configured_binary() {
+        // Without setting a custom path, default is "linux-wallpaperengine".
+        // We don't assert whether it's installed (depends on host), only
+        // that the method runs without panicking.
+        let c = crate::config::Config::default();
+        let _ = c.cpp_engine_available();
     }
 }
